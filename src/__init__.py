@@ -1,0 +1,2 @@
+"""Fisheye panorama prototype."""
+

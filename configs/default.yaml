@@ -1,0 +1,46 @@
+camera:
+  model: equalarea
+  cx: 960.0
+  cy: 583.0
+  radius_x: 814.0
+  radius_y: 810.0
+  fisheye_fov_deg: 190.0
+  distortion: [0.0, 0.0, 0.0, 0.0]
+
+projection:
+  width: 960
+  height: 720
+  hfov_deg: 90.0
+  vfov_deg: 85.0
+  interpolation: lanczos
+  views:
+    - {yaw: -45.0, pitch: 0.0, roll: 0.0}
+    - {yaw: 0.0, pitch: 0.0, roll: 0.0}
+    - {yaw: 45.0, pitch: 0.0, roll: 0.0}
+
+restoration:
+  enabled: false
+  type: nafnet
+  weights: weights/NAFNet-REDS-width64.pth
+  architecture_module: third_party.NAFNet.basicsr.models.archs.NAFNet_arch
+  architecture_class: NAFNet
+  device: cuda
+  fp16: true
+  width: 64
+  enc_blk_nums: [1, 1, 1, 28]
+  middle_blk_num: 1
+  dec_blk_nums: [1, 1, 1, 1]
+
+stitching:
+  backend: known_geometry
+  panorama_width: 2688
+  panorama_height: 720
+  overlap_fraction: 0.1
+  blend: multiband
+  blend_strength: 5
+
+output:
+  save_debug: true
+  save_raw_views: true
+  save_restored_views: true
+
