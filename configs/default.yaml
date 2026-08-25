@@ -1,8 +1,8 @@
 camera:
   model: equalarea
   cx: 960.0
-  cy: 583.0
-  radius_x: 814.0
+  cy: 580.0
+  radius_x: 810.0
   radius_y: 810.0
   fisheye_fov_deg: 190.0
   distortion: [0.0, 0.0, 0.0, 0.0]
@@ -14,9 +14,9 @@ projection:
   vfov_deg: 85.0
   interpolation: lanczos
   views:
-    - {yaw: -45.0, pitch: 0.0, roll: 0.0}
-    - {yaw: 0.0, pitch: 0.0, roll: 0.0}
-    - {yaw: 45.0, pitch: 0.0, roll: 0.0}
+    - {yaw: -50.0, pitch: -6.0, roll: 0.0}
+    - {yaw: 0.0, pitch: -6.0, roll: 0.0}
+    - {yaw: 50.0, pitch: -6.0, roll: 0.0}
 
 restoration:
   enabled: false
@@ -33,14 +33,25 @@ restoration:
 
 stitching:
   backend: known_geometry
-  panorama_width: 2688
+  projection: equirectangular
+  panorama_width: 1996
   panorama_height: 720
-  overlap_fraction: 0.1
+
+  # Keep the large angular overlap, but assign every panorama pixel to the
+  # perspective view whose optical axis is closest to that ray.
+  ownership: nearest_axis
+  seam:
+    method: graphcut
+    search_band_deg: 4.0
+    feather_px: 20
+
+  # Do not select NAFNet output near a panel border when another view has a
+  # valid interior sample. Border pixels remain usable at panorama boundaries.
+  border_margin_px: 32
   blend: multiband
-  blend_strength: 5
+  blend_levels: 4
 
 output:
   save_debug: true
   save_raw_views: true
   save_restored_views: true
-

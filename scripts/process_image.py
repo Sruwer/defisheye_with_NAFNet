@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse, sys
 from pathlib import Path
+import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from src.pipeline import FisheyePanoramaPipeline
 from src.utils import load_config, save_json
@@ -16,7 +17,8 @@ def main():
     image=cv2.imread(args.input)
     if image is None: raise SystemExit(f"Cannot read input image: {args.input}")
     cfg=load_config(args.config); out=Path(args.output); out.mkdir(parents=True,exist_ok=True)
-    result=FisheyePanoramaPipeline(cfg,args.restoration).process(image)
+    pipe=FisheyePanoramaPipeline(cfg,args.restoration)
+    result=pipe.process(image)
     cv2.imwrite(str(out/"input.png"),image)
     for folder,items in (("raw",result.raw_views),("restored",result.restored_views)):
         d=out/folder; d.mkdir(exist_ok=True)
@@ -24,7 +26,15 @@ def main():
     cv2.imwrite(str(out/"panorama_without_nafnet.png"),result.panorama_raw)
     cv2.imwrite(str(out/"panorama_with_restoration.png"),result.panorama)
     cv2.imwrite(str(out/"valid_mask.png"),result.debug["valid_mask"])
+    if cfg.get("output",{}).get("save_debug",False):
+        ownership=result.debug["ownership"]
+        ownership_debug=np.zeros(ownership.shape,np.uint8)
+        valid=ownership>=0
+        ownership_debug[valid]=np.rint((ownership[valid]+1)*255/(len(pipe.views)+1)).astype(np.uint8)
+        cv2.imwrite(str(out/"ownership.png"),ownership_debug)
+        weights_dir=out/"blend_weights"; weights_dir.mkdir(exist_ok=True)
+        for i,weight in enumerate(result.debug["blend_weights"]):
+            cv2.imwrite(str(weights_dir/f"view_{i:02d}.png"),np.rint(weight*255).astype(np.uint8))
     save_json(out/"timings.json",result.timings)
     print(f"Saved output to {out}; result shape={result.panorama.shape}; total={result.timings['total']:.3f}s")
 if __name__=="__main__": main()
-

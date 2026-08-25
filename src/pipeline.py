@@ -26,7 +26,22 @@ class FisheyePanoramaPipeline:
         self.restorer=IdentityRestorer() if mode=="none" else NAFNetRestorer(rc)
         sc=config["stitching"]
         if sc.get("backend") != "known_geometry": raise ValueError("This prototype currently supports stitching.backend=known_geometry")
-        self.stitcher=KnownGeometryStitcher(sc.get("overlap_fraction",.1),sc.get("blend_strength",5))
+        seam = sc.get("seam", {})
+        self.stitcher=KnownGeometryStitcher(
+            views=self.views,
+            hfov_deg=p["hfov_deg"],
+            vfov_deg=self.projector.vfov_deg,
+            panorama_width=sc["panorama_width"],
+            panorama_height=sc["panorama_height"],
+            projection=sc.get("projection", "equirectangular"),
+            ownership=sc.get("ownership", "nearest_axis"),
+            seam_method=seam.get("method", "graphcut"),
+            seam_search_band_deg=seam.get("search_band_deg", 4.0),
+            feather_px=seam.get("feather_px", 20),
+            border_margin_px=sc.get("border_margin_px", 32),
+            blend=sc.get("blend", "multiband"),
+            blend_levels=sc.get("blend_levels", sc.get("blend_strength", 4)),
+        )
 
     def process(self, image: np.ndarray) -> PipelineResult:
         started=perf_counter(); raw=[]; masks=[]
@@ -39,8 +54,24 @@ class FisheyePanoramaPipeline:
             t=perf_counter(); restored.append(self.restorer.restore(panel)); per_view.append(perf_counter()-t)
         t=perf_counter(); pano_raw,raw_mask=self.stitcher.stitch(raw,masks); raw_stitch=perf_counter()-t
         t=perf_counter(); panorama,mask=self.stitcher.stitch(restored,masks); restore_stitch=perf_counter()-t
+        stitching_debug = self.stitcher.last_debug
+        ys, xs = np.nonzero(mask)
+        if len(xs):
+            y0, y1 = int(ys.min()), int(ys.max() + 1)
+            x0, x1 = int(xs.min()), int(xs.max() + 1)
+            ownership = stitching_debug["ownership"][y0:y1, x0:x1]
+            blend_weights = stitching_debug["blend_weights"][:, y0:y1, x0:x1]
+        else:
+            ownership = stitching_debug["ownership"][:0, :0]
+            blend_weights = stitching_debug["blend_weights"][:, :0, :0]
         panorama,mask=crop_to_valid_region(panorama,mask); pano_raw,_=crop_to_valid_region(pano_raw,raw_mask)
         timings={"projection":projection,"restoration_per_view":per_view,"restoration":sum(per_view),
                  "stitching_raw":raw_stitch,"stitching_restored":restore_stitch,"total":perf_counter()-started}
-        return PipelineResult(panorama,pano_raw,raw,restored,masks,timings,{"valid_mask":mask})
-
+        debug={
+            "valid_mask": mask,
+            "ownership": ownership,
+            "blend_weights": blend_weights,
+            "longitude_bounds_deg": stitching_debug["longitude_bounds_deg"],
+            "latitude_bounds_deg": stitching_debug["latitude_bounds_deg"],
+        }
+        return PipelineResult(panorama,pano_raw,raw,restored,masks,timings,debug)

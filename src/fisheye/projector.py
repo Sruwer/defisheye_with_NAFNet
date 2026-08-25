@@ -29,7 +29,9 @@ class PerspectiveProjector:
 
     def maps(self, view: View) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         x = ((np.arange(self.width)+0.5)/self.width*2-1)*np.tan(np.deg2rad(self.hfov_deg)/2)
-        y = -((np.arange(self.height)+0.5)/self.height*2-1)*np.tan(np.deg2rad(self.vfov_deg)/2)
+        # The camera model uses image coordinates (x right, y down).  Keeping
+        # perspective Y in the same convention prevents a vertical flip.
+        y = ((np.arange(self.height)+0.5)/self.height*2-1)*np.tan(np.deg2rad(self.vfov_deg)/2)
         xx, yy = np.meshgrid(x, y)
         rays = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
         # Explicit multiply avoids a known Accelerate/NumPy 2 warning emitted by
@@ -48,6 +50,11 @@ class PerspectiveProjector:
         flags = {"nearest": cv2.INTER_NEAREST, "linear": cv2.INTER_LINEAR,
                  "cubic": cv2.INTER_CUBIC, "lanczos": cv2.INTER_LANCZOS4}
         mx, my, valid = self.maps(view)
+        source_height, source_width = image.shape[:2]
+        # A cropped fisheye circle can extend beyond the stored image. Those
+        # rays must not become valid black samples during panorama blending.
+        valid &= ((mx >= 0) & (mx <= source_width - 1)
+                  & (my >= 0) & (my <= source_height - 1))
         out = cv2.remap(image, mx, my, flags[self.interpolation], borderMode=cv2.BORDER_CONSTANT)
         out[~valid] = 0
         return out, valid.astype(np.uint8)*255
