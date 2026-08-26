@@ -18,6 +18,22 @@ python scripts/process_image.py --input /path/to/000036.jpg --output outputs/fra
 
 The first run stores content-addressed projection and panorama LUT files under `.cache/geometry`. Later images with identical camera, view, FOV, and panorama settings load those arrays from disk. Changing any geometry parameter automatically selects a new cache key. GraphCut itself remains per-image because its seam depends on image content.
 
+Process a complete folder in one Python process so the LUTs (and NAFNet, when
+enabled) are loaded only once and remain in RAM for every frame:
+
+```bash
+python scripts/process_folder.py \
+  --input-dir /path/to/images \
+  --output-dir outputs/dataset \
+  --config configs/default.yaml \
+  --restoration none
+```
+
+Add `--recursive` to scan subdirectories, `--overwrite` to replace existing
+panoramas, or `--save-raw-panorama` to additionally save the no-restoration
+result when NAFNet is enabled. Output keeps the input directory structure and
+uses lossless PNG. A run report is written to `batch_summary.json`.
+
 Debug output includes `ownership.png` and one blend-weight mask per view. For a deterministic midpoint seam, set `stitching.seam.method: nearest_axis`; this is also a useful diagnostic if GraphCut follows an undesirable object boundary.
 
 For NAFNet, clone the official repository under `third_party/NAFNet`, place `NAFNet-REDS-width64.pth` under `weights/`, and run with `--restoration nafnet`. Raw and restored views stay separate, so an ANAFNet wrapper can later replace `NAFNetRestorer` without changing projection or stitching.
