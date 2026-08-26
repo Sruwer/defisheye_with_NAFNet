@@ -19,8 +19,10 @@ class PipelineResult:
 class FisheyePanoramaPipeline:
     def __init__(self, config: dict, restoration_override: str | None = None):
         self.config=config; c=config["camera"]; p=config["projection"]
+        cache_config=config.get("geometry_cache", {})
+        cache_dir=cache_config.get("directory", ".cache/geometry") if cache_config.get("enabled", True) else None
         camera=RadialFisheyeModel(c["cx"],c["cy"],c["radius_x"],c["radius_y"],c["fisheye_fov_deg"],c["model"],tuple(c.get("distortion",[0]*4)))
-        self.projector=PerspectiveProjector(camera,p["width"],p["height"],p["hfov_deg"],p.get("vfov_deg"),p.get("interpolation","lanczos"))
+        self.projector=PerspectiveProjector(camera,p["width"],p["height"],p["hfov_deg"],p.get("vfov_deg"),p.get("interpolation","lanczos"),cache_dir)
         self.views=[View(**v) for v in p["views"]]
         rc=config["restoration"]; mode=restoration_override or (rc["type"] if rc.get("enabled") else "none")
         self.restorer=IdentityRestorer() if mode=="none" else NAFNetRestorer(rc)
@@ -41,7 +43,14 @@ class FisheyePanoramaPipeline:
             border_margin_px=sc.get("border_margin_px", 32),
             blend=sc.get("blend", "multiband"),
             blend_levels=sc.get("blend_levels", sc.get("blend_strength", 4)),
+            cache_dir=cache_dir,
         )
+
+    def prepare_geometry_cache(self) -> dict:
+        return {
+            "projection": self.projector.prepare(self.views),
+            "stitching": self.stitcher.prepare(self.projector.height, self.projector.width),
+        }
 
     def process(self, image: np.ndarray) -> PipelineResult:
         started=perf_counter(); raw=[]; masks=[]
@@ -73,5 +82,9 @@ class FisheyePanoramaPipeline:
             "blend_weights": blend_weights,
             "longitude_bounds_deg": stitching_debug["longitude_bounds_deg"],
             "latitude_bounds_deg": stitching_debug["latitude_bounds_deg"],
+            "geometry_cache": {
+                "projection": self.projector.cache_report(),
+                "stitching": self.stitcher.cache_report(),
+            },
         }
         return PipelineResult(panorama,pano_raw,raw,restored,masks,timings,debug)

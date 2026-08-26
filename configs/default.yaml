@@ -7,6 +7,12 @@ camera:
   fisheye_fov_deg: 190.0
   distortion: [0.0, 0.0, 0.0, 0.0]
 
+# Projection and panorama lookup tables are generated on the first run and
+# reused for every image with the same calibration and geometry settings.
+geometry_cache:
+  enabled: true
+  directory: .cache/geometry
+
 projection:
   width: 960
   height: 720

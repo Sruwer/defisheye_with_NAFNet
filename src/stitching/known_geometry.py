@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from ..fisheye.projector import View, _rotation
+from ..geometry_cache import cache_path, load_arrays, save_arrays
 
 
 def _local_to_world(rays: np.ndarray, rotation: np.ndarray) -> np.ndarray:
@@ -65,6 +67,7 @@ class KnownGeometryStitcher:
         border_margin_px: int = 32,
         blend: str = "multiband",
         blend_levels: int = 4,
+        cache_dir: str | Path | None = None,
     ):
         if not views:
             raise ValueError("At least one view is required")
@@ -98,9 +101,12 @@ class KnownGeometryStitcher:
         self.border_margin_px = int(border_margin_px)
         self.blend = blend
         self.blend_levels = int(blend_levels)
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
 
         self._geometry_key: tuple[int, int] | None = None
         self._geometry: _WarpGeometry | None = None
+        self._geometry_cache_source = "not_prepared"
+        self._geometry_cache_path: Path | None = None
         self.last_debug: dict[str, object] = {}
 
     @staticmethod
@@ -218,12 +224,96 @@ class KnownGeometryStitcher:
             lat_bounds,
         )
 
+    def _cache_path(self, panel_height: int, panel_width: int) -> Path | None:
+        return cache_path(
+            self.cache_dir,
+            "perspective-panorama-v1",
+            {
+                "views": [
+                    {"yaw": view.yaw, "pitch": view.pitch, "roll": view.roll}
+                    for view in self.views
+                ],
+                "hfov_deg": self.hfov_deg,
+                "vfov_deg": self.vfov_deg,
+                "panel_width": panel_width,
+                "panel_height": panel_height,
+                "panorama_width": self.panorama_width,
+                "panorama_height": self.panorama_height,
+                "projection": self.projection,
+                "border_margin_px": self.border_margin_px,
+            },
+        )
+
+    def _load_geometry(self, path: Path | None) -> _WarpGeometry | None:
+        names = {
+            "map_x",
+            "map_y",
+            "geometric_valid",
+            "selection_valid",
+            "angles",
+            "longitude_bounds_deg",
+            "latitude_bounds_deg",
+        }
+        cached = load_arrays(path, names)
+        if cached is None:
+            return None
+        expected = (len(self.views), self.panorama_height, self.panorama_width)
+        if any(cached[name].shape != expected for name in names - {
+            "longitude_bounds_deg", "latitude_bounds_deg"
+        }):
+            return None
+        if cached["longitude_bounds_deg"].shape != (2,) or cached["latitude_bounds_deg"].shape != (2,):
+            return None
+        return _WarpGeometry(
+            [x.astype(np.float32, copy=False) for x in cached["map_x"]],
+            [x.astype(np.float32, copy=False) for x in cached["map_y"]],
+            [x.astype(bool, copy=False) for x in cached["geometric_valid"]],
+            [x.astype(bool, copy=False) for x in cached["selection_valid"]],
+            cached["angles"].astype(np.float32, copy=False),
+            tuple(float(x) for x in cached["longitude_bounds_deg"]),
+            tuple(float(x) for x in cached["latitude_bounds_deg"]),
+        )
+
+    @staticmethod
+    def _save_geometry(path: Path | None, geometry: _WarpGeometry) -> None:
+        save_arrays(
+            path,
+            {
+                "map_x": np.stack(geometry.map_x),
+                "map_y": np.stack(geometry.map_y),
+                "geometric_valid": np.stack(geometry.geometric_valid),
+                "selection_valid": np.stack(geometry.selection_valid),
+                "angles": geometry.angles,
+                "longitude_bounds_deg": np.asarray(geometry.longitude_bounds_deg),
+                "latitude_bounds_deg": np.asarray(geometry.latitude_bounds_deg),
+            },
+        )
+
     def _get_geometry(self, panel_height: int, panel_width: int) -> _WarpGeometry:
         key = (panel_height, panel_width)
         if self._geometry is None or self._geometry_key != key:
-            self._geometry = self._build_geometry(panel_height, panel_width)
+            path = self._cache_path(panel_height, panel_width)
+            self._geometry = self._load_geometry(path)
+            if self._geometry is None:
+                self._geometry = self._build_geometry(panel_height, panel_width)
+                self._save_geometry(path, self._geometry)
+                self._geometry_cache_source = "computed" if path is not None else "disabled"
+            else:
+                self._geometry_cache_source = "disk"
+            self._geometry_cache_path = path
             self._geometry_key = key
         return self._geometry
+
+    def prepare(self, panel_height: int, panel_width: int) -> dict:
+        self._get_geometry(panel_height, panel_width)
+        return self.cache_report()
+
+    def cache_report(self) -> dict:
+        return {
+            "enabled": self.cache_dir is not None,
+            "source": self._geometry_cache_source,
+            "path": str(self._geometry_cache_path) if self._geometry_cache_path is not None else None,
+        }
 
     def _warp_inputs(
         self,

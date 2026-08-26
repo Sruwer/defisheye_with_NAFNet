@@ -35,6 +35,7 @@ def main():
         weights_dir=out/"blend_weights"; weights_dir.mkdir(exist_ok=True)
         for i,weight in enumerate(result.debug["blend_weights"]):
             cv2.imwrite(str(weights_dir/f"view_{i:02d}.png"),np.rint(weight*255).astype(np.uint8))
+        save_json(out/"geometry_cache.json",result.debug["geometry_cache"])
     save_json(out/"timings.json",result.timings)
     print(f"Saved output to {out}; result shape={result.panorama.shape}; total={result.timings['total']:.3f}s")
 if __name__=="__main__": main()

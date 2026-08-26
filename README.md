@@ -12,8 +12,11 @@ python -m venv .venv
 pip install -e '.[dev]'
 pytest
 python scripts/test_projection.py /path/to/000036.jpg
+python scripts/build_geometry_cache.py --config configs/default.yaml
 python scripts/process_image.py --input /path/to/000036.jpg --output outputs/frame001 --restoration none
 ```
+
+The first run stores content-addressed projection and panorama LUT files under `.cache/geometry`. Later images with identical camera, view, FOV, and panorama settings load those arrays from disk. Changing any geometry parameter automatically selects a new cache key. GraphCut itself remains per-image because its seam depends on image content.
 
 Debug output includes `ownership.png` and one blend-weight mask per view. For a deterministic midpoint seam, set `stitching.seam.method: nearest_axis`; this is also a useful diagnostic if GraphCut follows an undesirable object boundary.
 

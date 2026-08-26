@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 from src.fisheye.camera_models import RadialFisheyeModel
 from src.fisheye.projector import PerspectiveProjector, View
@@ -21,7 +23,7 @@ def test_projection_mask_excludes_pixels_outside_cropped_input():
     # The configured optical center is outside this deliberately small crop.
     assert not mask.any()
 
-def stitcher(feather_px=0):
+def stitcher(feather_px=0, cache_dir=None):
     return KnownGeometryStitcher(
         views=[View(yaw=-50), View(yaw=0), View(yaw=50)],
         hfov_deg=90,
@@ -32,6 +34,7 @@ def stitcher(feather_px=0):
         feather_px=feather_px,
         border_margin_px=0,
         blend="feather",
+        cache_dir=cache_dir,
     )
 
 def test_spherical_panorama_shape_and_angular_ownership():
@@ -63,3 +66,41 @@ def test_blending_is_limited_to_narrow_seam_bands():
     contributors=(weights[:,y,:]>1e-4).sum(axis=0)
     # Two seams, each mixed only for approximately twice feather_px.
     assert np.count_nonzero(contributors>1)<=4*compositor.feather_px+4
+
+def test_projection_lut_is_loaded_from_disk(tmp_path):
+    view=View(yaw=-50,pitch=-6)
+    first=PerspectiveProjector(camera(),160,120,90,85,cache_dir=tmp_path)
+    first_maps=first.maps(view)
+    first_entry=first.cache_report()["entries"][0]
+    assert first_entry["source"]=="computed"
+    assert Path(first_entry["path"]).is_file()
+
+    second=PerspectiveProjector(camera(),160,120,90,85,cache_dir=tmp_path)
+    second_maps=second.maps(view)
+    assert second.cache_report()["entries"][0]["source"]=="disk"
+    for expected,actual in zip(first_maps,second_maps):
+        np.testing.assert_array_equal(actual,expected)
+
+def test_panorama_lut_is_loaded_and_geometry_change_invalidates_key(tmp_path):
+    first=stitcher(cache_dir=tmp_path)
+    first_report=first.prepare(120,160)
+    assert first_report["source"]=="computed"
+
+    second=stitcher(cache_dir=tmp_path)
+    second_report=second.prepare(120,160)
+    assert second_report["source"]=="disk"
+    assert second_report["path"]==first_report["path"]
+
+    changed=KnownGeometryStitcher(
+        views=[View(yaw=-50),View(yaw=0),View(yaw=50)],
+        hfov_deg=91,
+        vfov_deg=85,
+        panorama_width=380,
+        panorama_height=170,
+        seam_method="nearest_axis",
+        blend="feather",
+        cache_dir=tmp_path,
+    )
+    changed_report=changed.prepare(120,160)
+    assert changed_report["source"]=="computed"
+    assert changed_report["path"]!=first_report["path"]
