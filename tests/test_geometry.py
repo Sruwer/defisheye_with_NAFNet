@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 from src.fisheye.camera_models import RadialFisheyeModel
+from src.fisheye.direct_panorama import DirectFisheyePanoramaProjector
 from src.fisheye.projector import PerspectiveProjector, View
 from src.pipeline import FisheyePanoramaPipeline
 from src.stitching.known_geometry import KnownGeometryStitcher
@@ -150,3 +151,26 @@ def test_identity_pipeline_stitches_only_once():
     assert calls==1
     assert result.panorama_raw is not None
     np.testing.assert_array_equal(result.panorama,result.panorama_raw)
+
+def test_direct_panorama_lut_is_reused_from_disk_and_memory(tmp_path):
+    kwargs={
+        "camera": RadialFisheyeModel(50,50,48,48,180,"equalarea"),
+        "views": [View(yaw=-35),View(yaw=0),View(yaw=35)],
+        "hfov_deg": 70,
+        "vfov_deg": 60,
+        "panorama_width": 100,
+        "panorama_height": 50,
+        "cache_dir": tmp_path,
+    }
+    image=np.full((100,100,3),127,np.uint8)
+    first=DirectFisheyePanoramaProjector(**kwargs)
+    assert first.prepare()["source"]=="computed"
+    first_result=first.project(image)
+    source_lut=first._source_luts[(100,100)]
+    first.project(image)
+    assert first._source_luts[(100,100)] is source_lut
+
+    second=DirectFisheyePanoramaProjector(**kwargs)
+    assert second.prepare()["source"]=="disk"
+    second_result=second.project(image)
+    np.testing.assert_array_equal(second_result,first_result)

@@ -8,7 +8,7 @@ from time import perf_counter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.pipeline import FisheyePanoramaPipeline
+from src.fisheye import DirectFisheyePanoramaProjector, RadialFisheyeModel, View
 from src.utils import load_config, save_json
 
 
@@ -31,8 +31,6 @@ def _images_in(
     for path in iterator:
         if not path.is_file() or path.suffix.lower() not in extensions:
             continue
-        # Do not consume results again when a recursive output directory lives
-        # below the input directory.
         if path.resolve().is_relative_to(output_resolved):
             continue
         images.append(path)
@@ -43,18 +41,78 @@ def _output_path(input_path: Path, input_dir: Path, output_dir: Path) -> Path:
     return (output_dir / input_path.relative_to(input_dir)).with_suffix(".png")
 
 
+def _projector(config: dict, interpolation: str) -> DirectFisheyePanoramaProjector:
+    camera_config = config["camera"]
+    projection_config = config["projection"]
+    stitching_config = config["stitching"]
+    cache_config = config.get("geometry_cache", {})
+    cache_dir = (
+        cache_config.get("directory", ".cache/geometry")
+        if cache_config.get("enabled", True)
+        else None
+    )
+    camera = RadialFisheyeModel(
+        camera_config["cx"],
+        camera_config["cy"],
+        camera_config["radius_x"],
+        camera_config["radius_y"],
+        camera_config["fisheye_fov_deg"],
+        camera_config["model"],
+        tuple(camera_config.get("distortion", [0.0] * 4)),
+    )
+    views = [View(**view) for view in projection_config["views"]]
+    vfov_deg = projection_config.get("vfov_deg")
+    if vfov_deg is None:
+        import numpy as np
+
+        vfov_deg = np.rad2deg(
+            2
+            * np.arctan(
+                np.tan(np.deg2rad(projection_config["hfov_deg"]) / 2)
+                * projection_config["height"]
+                / projection_config["width"]
+            )
+        )
+    return DirectFisheyePanoramaProjector(
+        camera,
+        views,
+        projection_config["hfov_deg"],
+        vfov_deg,
+        stitching_config["panorama_width"],
+        stitching_config["panorama_height"],
+        interpolation=interpolation,
+        cache_dir=cache_dir,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Process an image folder while keeping geometry LUTs in RAM"
+        description=(
+            "Fast folder processing via one direct fisheye-to-panorama LUT kept in RAM"
+        )
     )
     parser.add_argument("--input-dir", "--input", required=True, type=Path)
     parser.add_argument("--output-dir", "--output", required=True, type=Path)
     parser.add_argument("--config", default="configs/default.yaml")
-    parser.add_argument("--restoration", choices=("none", "nafnet"))
+    # Retain compatibility with the first batch-script interface while making
+    # it impossible to accidentally initialize NAFNet on this optimized path.
+    parser.add_argument("--restoration", choices=("none",), default="none", help=argparse.SUPPRESS)
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
-    parser.add_argument("--save-raw-panorama", action="store_true")
+    parser.add_argument(
+        "--interpolation",
+        choices=("linear", "cubic", "lanczos"),
+        default="linear",
+        help="Remap interpolation; linear is fastest and is the default",
+    )
+    parser.add_argument(
+        "--png-compression",
+        type=int,
+        choices=range(10),
+        default=0,
+        help="PNG compression 0-9; lower is faster (default: 0)",
+    )
     parser.add_argument(
         "--extensions",
         nargs="+",
@@ -81,22 +139,23 @@ def main() -> int:
     except ImportError:
         raise SystemExit("OpenCV is required: pip install -e .")
 
+    cv2.setUseOptimized(True)
     config = load_config(args.config)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # This is deliberately outside the frame loop. Both the projection LUTs
-    # and the panorama LUT are loaded/computed exactly once and then retained
-    # by these two long-lived objects for the entire dataset.
-    pipeline = FisheyePanoramaPipeline(config, args.restoration)
-    cache_report = pipeline.prepare_geometry_cache()
-    print(f"Geometry cache prepared once: {cache_report}")
+    # Construct and prepare once. All following calls share the same fixed-point
+    # map arrays; no .npz file is touched inside the frame loop.
+    projector = _projector(config, args.interpolation)
+    cache_report = projector.prepare()
+    print(f"Direct LUT prepared once: {cache_report}")
     print(f"Found {len(image_paths)} image(s)")
 
     started = perf_counter()
     processed = 0
     skipped = 0
+    remap_seconds = 0.0
     failures: list[dict[str, str]] = []
-    timing_sums: dict[str, float] = {}
+    png_params = [cv2.IMWRITE_PNG_COMPRESSION, args.png_compression]
 
     for index, input_path in enumerate(image_paths, start=1):
         destination = _output_path(input_path, input_dir, output_dir)
@@ -109,28 +168,19 @@ def main() -> int:
             image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
             if image is None:
                 raise ValueError("OpenCV could not decode the image")
-            result = pipeline.process(
-                image, include_raw_panorama=args.save_raw_panorama
-            )
+
+            frame_started = perf_counter()
+            panorama = projector.project(image)
+            remap_seconds += perf_counter() - frame_started
+
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if not cv2.imwrite(str(destination), result.panorama):
+            if not cv2.imwrite(str(destination), panorama, png_params):
                 raise OSError(f"Could not write {destination}")
-
-            if args.save_raw_panorama and pipeline.restoration_mode != "none":
-                assert result.panorama_raw is not None
-                raw_destination = output_dir / "raw_without_restoration" / input_path.relative_to(input_dir)
-                raw_destination = raw_destination.with_suffix(".png")
-                raw_destination.parent.mkdir(parents=True, exist_ok=True)
-                if not cv2.imwrite(str(raw_destination), result.panorama_raw):
-                    raise OSError(f"Could not write {raw_destination}")
-
-            for name, value in result.timings.items():
-                if isinstance(value, (int, float)):
-                    timing_sums[name] = timing_sums.get(name, 0.0) + float(value)
             processed += 1
             print(
                 f"[{index}/{len(image_paths)}] {input_path.name} -> "
-                f"{destination.relative_to(output_dir)} ({result.timings['total']:.3f}s)"
+                f"{destination.relative_to(output_dir)} "
+                f"({perf_counter() - frame_started:.3f}s)"
             )
         except Exception as exc:
             failures.append({"input": str(input_path), "error": str(exc)})
@@ -140,6 +190,7 @@ def main() -> int:
 
     elapsed = perf_counter() - started
     summary = {
+        "mode": "direct_fisheye_to_panorama_no_nafnet",
         "input_directory": str(input_dir),
         "output_directory": str(output_dir),
         "discovered": len(image_paths),
@@ -147,11 +198,12 @@ def main() -> int:
         "skipped": skipped,
         "failed": len(failures),
         "elapsed_seconds": elapsed,
+        "remap_seconds": remap_seconds,
         "frames_per_second": processed / elapsed if elapsed > 0 else 0.0,
-        "average_timings": {
-            name: total / processed for name, total in timing_sums.items()
-        } if processed else {},
-        "geometry_cache": cache_report,
+        "average_remap_seconds": remap_seconds / processed if processed else 0.0,
+        "interpolation": args.interpolation,
+        "png_compression": args.png_compression,
+        "geometry_cache": projector.cache_report(),
         "failures": failures,
     }
     save_json(output_dir / "batch_summary.json", summary)
