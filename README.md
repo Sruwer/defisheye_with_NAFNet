@@ -38,6 +38,21 @@ panoramas (plus `batch_summary.json`) and preserves the input directory
 structure. `--interpolation linear` and `--png-compression 0` are the fastest
 defaults.
 
+Convert those panoramas back to the configured fisheye canvas with one cached
+inverse LUT:
+
+```bash
+python scripts/panorama_to_fisheye.py \
+  --input-dir outputs/panoramas \
+  --output-dir outputs/reconstructed_fisheye \
+  --config configs/default.yaml
+```
+
+The output fisheye size comes from `input.width` and `input.height`; it can be
+overridden with `--fisheye-width` and `--fisheye-height`. Only rays retained by
+the panorama can be reconstructed. Areas of the original fisheye outside the
+configured perspective-view coverage are written as black pixels.
+
 Debug output includes `ownership.png` and one blend-weight mask per view. For a deterministic midpoint seam, set `stitching.seam.method: nearest_axis`; this is also a useful diagnostic if GraphCut follows an undesirable object boundary.
 
 For NAFNet, clone the official repository under `third_party/NAFNet`, place `NAFNet-REDS-width64.pth` under `weights/`, and run with `--restoration nafnet`. Raw and restored views stay separate, so an ANAFNet wrapper can later replace `NAFNetRestorer` without changing projection or stitching.

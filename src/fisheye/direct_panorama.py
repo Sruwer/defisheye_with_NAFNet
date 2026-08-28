@@ -44,6 +44,7 @@ class _SourceLut:
     map1: np.ndarray
     map2: np.ndarray
     valid: np.ndarray
+    crop_box: tuple[int, int, int, int]
 
 
 class DirectFisheyePanoramaProjector:
@@ -278,7 +279,10 @@ class DirectFisheyePanoramaProjector:
         ys, xs = np.nonzero(valid)
         if not len(xs):
             source_lut = _SourceLut(
-                self._lut.map1[:0, :0], self._lut.map2[:0, :0], valid[:0, :0]
+                self._lut.map1[:0, :0],
+                self._lut.map2[:0, :0],
+                valid[:0, :0],
+                (0, 0, 0, 0),
             )
         else:
             y0, y1 = int(ys.min()), int(ys.max() + 1)
@@ -289,6 +293,7 @@ class DirectFisheyePanoramaProjector:
                 np.ascontiguousarray(self._lut.map1[y0:y1, x0:x1]),
                 np.ascontiguousarray(self._lut.map2[y0:y1, x0:x1]),
                 np.ascontiguousarray(valid[y0:y1, x0:x1]),
+                (x0, y0, x1, y1),
             )
         self._source_luts[key] = source_lut
         return source_lut
@@ -322,4 +327,237 @@ class DirectFisheyePanoramaProjector:
             "path": str(self._cache_file) if self._cache_file is not None else None,
             "size_bytes": size_bytes,
             "resident_source_shapes": [list(shape) for shape in self._source_luts],
+        }
+
+
+class PanoramaFisheyeProjector:
+    """Reproject cropped panoramas made by the direct path back to fisheye."""
+
+    def __init__(
+        self,
+        camera: FisheyeCameraModel,
+        views: list[View],
+        hfov_deg: float,
+        vfov_deg: float,
+        panorama_width: int,
+        panorama_height: int,
+        fisheye_width: int,
+        fisheye_height: int,
+        *,
+        interpolation: str = "linear",
+        cache_dir: str | Path | None = None,
+    ):
+        if fisheye_width <= 0 or fisheye_height <= 0:
+            raise ValueError("Fisheye dimensions must be positive")
+        if interpolation not in {"linear", "cubic", "lanczos"}:
+            raise ValueError("interpolation must be linear, cubic, or lanczos")
+        self.camera = camera
+        self.views = list(views)
+        self.hfov_deg = float(hfov_deg)
+        self.vfov_deg = float(vfov_deg)
+        self.panorama_width = int(panorama_width)
+        self.panorama_height = int(panorama_height)
+        self.fisheye_width = int(fisheye_width)
+        self.fisheye_height = int(fisheye_height)
+        self.interpolation = interpolation
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+
+        self._forward = DirectFisheyePanoramaProjector(
+            camera,
+            views,
+            hfov_deg,
+            vfov_deg,
+            panorama_width,
+            panorama_height,
+            interpolation="linear",
+            cache_dir=cache_dir,
+        )
+        self._map1: np.ndarray | None = None
+        self._map2: np.ndarray | None = None
+        self._valid: np.ndarray | None = None
+        self._panorama_shape: tuple[int, int] | None = None
+        self._crop_box: tuple[int, int, int, int] | None = None
+        self._cache_source = "not_prepared"
+        self._cache_file: Path | None = None
+
+    @staticmethod
+    def _cv2():
+        return DirectFisheyePanoramaProjector._cv2()
+
+    def _cache_path(
+        self, crop_box: tuple[int, int, int, int]
+    ) -> Path | None:
+        return cache_path(
+            self.cache_dir,
+            "panorama-fisheye-direct-v1",
+            {
+                "camera_class": type(self.camera).__qualname__,
+                "camera": vars(self.camera),
+                "views": [
+                    {"yaw": view.yaw, "pitch": view.pitch, "roll": view.roll}
+                    for view in self.views
+                ],
+                "hfov_deg": self.hfov_deg,
+                "vfov_deg": self.vfov_deg,
+                "panorama_width": self.panorama_width,
+                "panorama_height": self.panorama_height,
+                "fisheye_width": self.fisheye_width,
+                "fisheye_height": self.fisheye_height,
+                "crop_box": crop_box,
+            },
+        )
+
+    def _build_maps(
+        self,
+        crop_box: tuple[int, int, int, int],
+        longitude_bounds: tuple[float, float],
+        latitude_bounds: tuple[float, float],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        cv2 = self._cv2()
+        pixel_x, pixel_y = np.meshgrid(
+            np.arange(self.fisheye_width, dtype=np.float64),
+            np.arange(self.fisheye_height, dtype=np.float64),
+        )
+        fisheye_pixels = np.stack((pixel_x, pixel_y), axis=-1)
+        rays = self.camera.unproject_pixels(fisheye_pixels)
+        _, fisheye_valid = self.camera.project_rays(rays)
+        coverage = self._forward._view_coverage(rays)
+
+        longitude = np.rad2deg(np.arctan2(rays[..., 0], rays[..., 2]))
+        reference = (longitude_bounds[0] + longitude_bounds[1]) / 2.0
+        longitude = reference + (longitude - reference + 180.0) % 360.0 - 180.0
+        latitude = np.rad2deg(
+            np.arcsin(np.clip(-rays[..., 1], -1.0, 1.0))
+        )
+        longitude_step = (longitude_bounds[1] - longitude_bounds[0]) / self.panorama_width
+        latitude_step = (latitude_bounds[1] - latitude_bounds[0]) / self.panorama_height
+        crop_x0, crop_y0, crop_x1, crop_y1 = crop_box
+        map_x = (
+            (longitude - longitude_bounds[0]) / longitude_step
+            - 0.5
+            - crop_x0
+        )
+        map_y = (
+            (latitude_bounds[1] - latitude) / latitude_step
+            - 0.5
+            - crop_y0
+        )
+        cropped_width = crop_x1 - crop_x0
+        cropped_height = crop_y1 - crop_y0
+        valid = (
+            fisheye_valid
+            & coverage
+            & (map_x >= 0)
+            & (map_x <= cropped_width - 1)
+            & (map_y >= 0)
+            & (map_y <= cropped_height - 1)
+        )
+        map_x = map_x.astype(np.float32)
+        map_y = map_y.astype(np.float32)
+        map_x[~valid] = -1.0
+        map_y[~valid] = -1.0
+        map1, map2 = cv2.convertMaps(
+            map_x, map_y, cv2.CV_16SC2, nninterpolation=False
+        )
+        return map1, map2, valid
+
+    def _load_maps(self, path: Path | None) -> dict[str, np.ndarray] | None:
+        cached = load_arrays(path, {"map1", "map2", "valid"})
+        expected = (self.fisheye_height, self.fisheye_width)
+        if cached is None or (
+            cached["map1"].shape != expected + (2,)
+            or cached["map2"].shape != expected
+            or cached["valid"].shape != expected
+        ):
+            return None
+        return cached
+
+    def prepare(self) -> dict:
+        if self._map1 is not None:
+            return self.cache_report()
+
+        self._forward.prepare()
+        source_lut = self._forward._source_lut(
+            self.fisheye_height, self.fisheye_width
+        )
+        forward_lut = self._forward._lut
+        assert forward_lut is not None
+        crop_box = source_lut.crop_box
+        path = self._cache_path(crop_box)
+        cached = self._load_maps(path)
+        if cached is None:
+            self._map1, self._map2, self._valid = self._build_maps(
+                crop_box,
+                forward_lut.longitude_bounds_deg,
+                forward_lut.latitude_bounds_deg,
+            )
+            save_arrays(
+                path,
+                {"map1": self._map1, "map2": self._map2, "valid": self._valid},
+            )
+            self._cache_source = "computed" if path is not None else "disabled"
+        else:
+            self._map1 = cached["map1"].astype(np.int16, copy=False)
+            self._map2 = cached["map2"].astype(np.uint16, copy=False)
+            self._valid = cached["valid"].astype(bool, copy=False)
+            self._cache_source = "disk"
+
+        self._crop_box = crop_box
+        self._panorama_shape = (
+            crop_box[3] - crop_box[1],
+            crop_box[2] - crop_box[0],
+        )
+        self._cache_file = path
+        # The inverse fixed-point maps are now self-contained. Releasing the
+        # forward LUT avoids retaining an extra copy for a reverse-only batch.
+        self._forward._source_luts.clear()
+        self._forward._lut = None
+        return self.cache_report()
+
+    def project(self, panorama: np.ndarray) -> np.ndarray:
+        self.prepare()
+        assert self._map1 is not None and self._map2 is not None
+        assert self._valid is not None and self._panorama_shape is not None
+        if panorama.shape[:2] != self._panorama_shape:
+            raise ValueError(
+                f"Expected panorama shape {self._panorama_shape}, got {panorama.shape[:2]}"
+            )
+        cv2 = self._cv2()
+        flags = {
+            "linear": cv2.INTER_LINEAR,
+            "cubic": cv2.INTER_CUBIC,
+            "lanczos": cv2.INTER_LANCZOS4,
+        }
+        result = cv2.remap(
+            panorama,
+            self._map1,
+            self._map2,
+            flags[self.interpolation],
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+        result[~self._valid] = 0
+        return result
+
+    @property
+    def valid_mask(self) -> np.ndarray:
+        self.prepare()
+        assert self._valid is not None
+        return self._valid
+
+    def cache_report(self) -> dict:
+        size_bytes = (
+            self._cache_file.stat().st_size
+            if self._cache_file and self._cache_file.is_file()
+            else None
+        )
+        return {
+            "enabled": self.cache_dir is not None,
+            "source": self._cache_source,
+            "path": str(self._cache_file) if self._cache_file is not None else None,
+            "size_bytes": size_bytes,
+            "expected_panorama_shape": list(self._panorama_shape)
+            if self._panorama_shape is not None
+            else None,
+            "fisheye_shape": [self.fisheye_height, self.fisheye_width],
+            "crop_box": list(self._crop_box) if self._crop_box is not None else None,
         }
